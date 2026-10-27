@@ -118,6 +118,18 @@ The FP400's action entity (`event.<fp400>_action`, plus a device trigger in the 
 | `approach` / `away` | Someone comes close to the sensor or walks away (distance set by **Approach distance**). |
 | `left_in`, `left_out`, `right_in`, `right_out` | Sideways movement, when **Movement events** is set to **Left and right**. |
 
+### Native zones (experimental)
+
+The sensor can also store up to 8 zones itself, like the Aqara app does. It then decides presence per zone, with each zone's own **Empty after** time, and reports it on its own endpoint: zone N is `binary_sensor.<fp400>_occupancy_<N+2>`. These zones keep working while positions pause and do not depend on Zigbee2MQTT. The card does not draw them yet; set them on the FP400's Exposes tab or with `zigbee2mqtt/<fp400>/set`:
+
+| Entity | Meaning |
+|---|---|
+| `native_zone_N_area` | Send a rectangle in centimetres, like `{"x_min":-100,"x_max":100,"y_min":50,"y_max":250}`, or `{"points":[[x,y],...]}`, to create or move zone N; `clear` removes it. The sensor stores whole 0.5 m cells. |
+| `zone_N_absence_timeout`, `zone_N_sensitivity` | That zone's **Empty after** time (0-300 s) and sensitivity. |
+| `native_zone_N_mask_hex`, `configured_zones` | What the sensor has stored. |
+
+The sensor pushes reports for five endpoints only (the room and zones 1-4); zones 5-8 are read once a minute, so keep zones that drive lights in slots 1-4. While a native zone is occupied, the room's own presence stays on until that zone empties too ([Koenkk/zigbee2mqtt#33146](https://github.com/Koenkk/zigbee2mqtt/issues/33146)).
+
 ## Good to know
 
 - Positions are in centimetres from the sensor: x is left/right, y is the distance in front of it. Walk along a new zone's edges once to check it.

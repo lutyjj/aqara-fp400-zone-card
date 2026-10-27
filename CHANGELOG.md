@@ -7,6 +7,10 @@ To update, get the new card through HACS and copy the new `z2m/aqara-fp400.mjs` 
 
 ## [Unreleased]
 
+### Added
+
+- Converter: native zones stored on the sensor (`native_zone_N_area`), with presence per zone on the sensor's zone endpoints. Uses the zone command format decoded in [Koenkk/zigbee2mqtt#33146](https://github.com/Koenkk/zigbee2mqtt/issues/33146) and the command IDs of the Matter model; each change is confirmed by reading the zones back.
+
 ## [0.4.1] - 2026-10-05
 
 ### Fixed

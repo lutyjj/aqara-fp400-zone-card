@@ -178,6 +178,7 @@ const installStatuses = ['level_facing_up', 'level_tilted_facing_up', 'level_rev
 const diagnosticAttributes = {installation_height: 4, installation_height_min: 5, installation_height_max: 6,
     installation_status: 7, installation_angle: 8, configured_zones: 16, maximum_zones: 17, learning_reporting_timeout: 22};
 const regionAttributes = {entry_exit_region: 18, interference_region: 19, monitoring_region: 20};
+const nativeZoneIds = [1, 2, 3, 4, 5, 6, 7, 8];
 function regionBuffer(value) {
     const mask = boundaryBuffer(value);
     if (mask.length !== 0 && mask.length !== 40) throw new Error('Unsupported region mask length');
@@ -242,10 +243,7 @@ function decodeInstallation(data) {
         if (raw === undefined) continue;
         if (key === 'installation_status') state[key] = installStatuses[raw] ?? `unknown_${raw}`;
         else if (key === 'configured_zones') {
-            if (Array.isArray(raw)) {
-                state[key] = JSON.stringify(raw);
-                state.configured_zone_count = raw.length;
-            }
+            if (Array.isArray(raw)) Object.assign(state, nativeZoneState(decodeNativeZones(raw)));
         } else if (Number.isInteger(raw)) state[key] = raw;
     }
     for (const [key, id] of Object.entries(regionAttributes)) {
@@ -262,7 +260,7 @@ const fp400InstallationReport = {
     convert: (model, msg) => msg.endpoint.ID === 1 ? decodeInstallation(msg.data) : undefined,
 };
 const fp400InstallationControl = {
-    key: [...Object.keys(diagnosticAttributes), 'configured_zone_count'],
+    key: [...Object.keys(diagnosticAttributes), 'configured_zone_count', ...nativeZoneIds.map(id => `native_zone_${id}_mask_hex`)],
     convertGet: async (entity, key, meta) => {
         await meta.device.getEndpoint(1).read(configCluster, [diagnosticAttributes[key] ?? 16], manufacturerOptions);
     },
@@ -347,6 +345,56 @@ const fp400AreaControl = {
         return writeRegion(meta.device, areaRegions[area], mask => setCells(mask, bits, key.endsWith('_add')));
     },
 };
+// Native zones: FC0A attribute 16 lists records of [u8 id, enum8 type, octstr 40-byte cell mask, bool enabled].
+// The sensor reports each zone's presence on its own endpoint (zone n on endpoint n + 2) with the zone's own
+// absence timeout. They are written with appendZone (4), updateZone (6) and removeZone (8), the command IDs of
+// the Matter model (matterjs-server's Aqara clusters). The sensor answers with cluster-specific responses that
+// carry no manufacturer code, so the commands do not wait for them: reading attribute 16 back confirms a change.
+export function decodeNativeZones(raw) {
+    if (!Array.isArray(raw)) return [];
+    return raw.filter(record => Array.isArray(record) && record.length >= 4).map(([id, type, cells, enabled]) => ({
+        id: id.elmVal, type: type.elmVal, mask: Buffer.from(cells.elmVal), enabled: Boolean(enabled.elmVal)}));
+}
+// zoneType 0 is a generic zone; it must be tagged enum8, which the sensor checks.
+export function nativeZoneRecord(id, mask) {
+    return [{elmType: 0x20, elmVal: id}, {elmType: 0x30, elmVal: 0}, {elmType: 0x41, elmVal: mask}, {elmType: 0x10, elmVal: 1}];
+}
+function nativeZoneState(zones) {
+    const state = {configured_zones: JSON.stringify(zones.map(zone => zone.id)), configured_zone_count: zones.length};
+    for (const id of nativeZoneIds) {
+        state[`native_zone_${id}_mask_hex`] = zones.find(zone => zone.id === id)?.mask.toString('hex') ?? 'clear';
+    }
+    return state;
+}
+const nativeZoneConfirmDelays = [500, 1000, 1500, 2000, 3000];
+const fp400NativeZoneControl = {
+    key: nativeZoneIds.map(id => `native_zone_${id}_area`),
+    convertSet: async (entity, key, value, meta) => {
+        const id = Number(key.split('_')[2]);
+        const shape = value === 'clear' ? null : typeof value === 'string' ? JSON.parse(value) : value;
+        const mask = shape && setCells(Buffer.alloc(40), shape.points ? polygonCells(shape.points) : gridBits(worldToGrid(shape)), true);
+        const endpoint = meta.device.getEndpoint(1);
+        const readZones = async () => decodeNativeZones((await endpoint.read(configCluster, [16], manufacturerOptions))[16]);
+        return withDeviceLock(meta.device, async () => {
+            const exists = (await readZones()).some(zone => zone.id === id);
+            const options = {...manufacturerOptions, disableDefaultResponse: true, disableResponse: true};
+            if (!mask) {
+                if (!exists) return {state: nativeZoneState(await readZones())};
+                await endpoint.command(configCluster, 'removeZone', {zoneId: id}, options);
+            } else {
+                await endpoint.command(configCluster, exists ? 'updateZone' : 'appendZone', {zone: nativeZoneRecord(id, mask)}, options);
+            }
+            // The sensor applies zone changes a moment later.
+            for (const delay of nativeZoneConfirmDelays) {
+                await new Promise(resolve => setTimeout(resolve, delay));
+                const zones = await readZones();
+                const zone = zones.find(item => item.id === id);
+                if (mask ? zone?.mask.equals(mask) : !zone) return {state: nativeZoneState(zones)};
+            }
+            throw new Error(`Native zone ${id} was not confirmed by the sensor`);
+        });
+    },
+};
 async function refreshFp400Configuration(endpoint) {
     for (const attributes of [Object.values(configOptions).map(option => option.id), [4, 5, 6, 7, 8, 22], [16, 17], [18], [19], [20]]) {
         await endpoint.read(configCluster, attributes, manufacturerOptions);
@@ -381,7 +429,15 @@ const fp400AdditionalExposes = [
     e.numeric('installation_angle', ea.STATE_GET).withUnit('°').withCategory('diagnostic').withDescription('Reported tilt angle; community interpretation'),
     e.numeric('maximum_zones', ea.STATE_GET).withCategory('diagnostic').withDescription('Maximum number of native detection zones'),
     e.numeric('configured_zone_count', ea.STATE_GET).withCategory('diagnostic').withDescription('Number of native zone records; not a person count'),
-    e.text('configured_zones', ea.STATE_GET).withCategory('diagnostic').withDescription('Native zone records for protocol investigation; zone commands are not yet implemented'),
+    e.text('configured_zones', ea.STATE_GET).withCategory('diagnostic').withDescription('IDs of the native zones stored on the sensor'),
+    ...nativeZoneIds.flatMap(id => [
+        e.text(`native_zone_${id}_area`, ea.SET).withCategory('config')
+            .withDescription(`Native zone ${id}, stored and evaluated on the sensor; its presence is occupancy_${id + 2}, with zone_${id}_absence_timeout and zone_${id}_sensitivity. ` +
+                'Sets the zone to a rectangle in centimetres, e.g. {"x_min":-100,"x_max":100,"y_min":50,"y_max":250}, or a turned shape as {"points":[[x,y],...]}; \'clear\' removes it. ' +
+                (id <= 4 ? 'Reported at once.' : 'Polled every minute: the sensor reports only five endpoints, so keep fast zones in slots 1-4.')),
+        e.text(`native_zone_${id}_mask_hex`, ea.STATE_GET).withCategory('diagnostic')
+            .withDescription(`Cells of native zone ${id} as 80 hex characters (20 rows × 16 columns), or 'clear'.`),
+    ]),
     e.numeric('learning_reporting_timeout', ea.STATE_GET).withUnit('s').withCategory('diagnostic').withDescription('Device learning reporting timeout; not a verified calibration duration'),
     e.enum('learning_state', ea.STATE, ['accepted', 'result_received']).withCategory('diagnostic').withDescription('Accepted means only command acknowledgement; result_received means event 3 was received'),
     e.numeric('learning_result_code', ea.STATE).withCategory('diagnostic').withDescription('Raw event 3 result: 0 is consistent with success in the community reference; interpretation remains provisional'),
@@ -804,7 +860,8 @@ export default {
         ...fp400InstallationControl.key.map(key => ({...fp400InstallationControl, key: [key]})),
         ...fp400RegionControl.key.map(key => ({...fp400RegionControl, key: [key]})),
         ...fp400RegionGet.key.map(key => ({...fp400RegionGet, key: [key]})),
-        ...fp400AreaControl.key.map(key => ({...fp400AreaControl, key: [key]})), fp400Refresh, ...Object.keys(configOptions).map((key) => ({...fp400ConfigControl, key: [key]})), fp400Learning, fp400SensitivityControl, fp400AbsenceControl, fp400DepthControl],
+        ...fp400AreaControl.key.map(key => ({...fp400AreaControl, key: [key]})),
+        ...fp400NativeZoneControl.key.map(key => ({...fp400NativeZoneControl, key: [key]})), fp400Refresh, ...Object.keys(configOptions).map((key) => ({...fp400ConfigControl, key: [key]})), fp400Learning, fp400SensitivityControl, fp400AbsenceControl, fp400DepthControl],
     exposes: [...softwareZoneExposes, ...fp400TrackingExposes,
         ...fp400ZoneExposes,
         ...fp400AdditionalExposes,
@@ -839,8 +896,13 @@ export default {
             name: configCluster, ID: 64522, manufacturerCode: 0x115f,
             attributes: Object.fromEntries(Object.entries(configOptions).map(([key, option]) =>
                 [key, {ID: option.id, name: key, type: option.type, write: true}])),
-            commands: {startLearning: {ID: 3, name: 'startLearning', parameters: []}},
-            commandsResponse: {},
+            commands: {startLearning: {ID: 3, name: 'startLearning', parameters: []},
+                appendZone: {ID: 4, name: 'appendZone', parameters: [{name: 'zone', type: 0x4c}]},
+                updateZone: {ID: 6, name: 'updateZone', parameters: [{name: 'zone', type: 0x4c}]},
+                removeZone: {ID: 8, name: 'removeZone', parameters: [{name: 'zoneId', type: 0x20}]}},
+            commandsResponse: {appendZoneResponse: {ID: 5, name: 'appendZoneResponse', parameters: [{name: 'status', type: 0x20}]},
+                updateZoneResponse: {ID: 7, name: 'updateZoneResponse', parameters: [{name: 'status', type: 0x20}]},
+                removeZoneResponse: {ID: 9, name: 'removeZoneResponse', parameters: [{name: 'status', type: 0x20}]}},
         }),
         m.deviceAddCustomCluster('aqaraFp400Radar', {
             name: 'aqaraFp400Radar',
