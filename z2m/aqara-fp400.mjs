@@ -841,6 +841,8 @@ export default {
     zigbeeModel: ['lumi.models.4447_8295'],
     model: 'FP400',
     vendor: 'Aqara',
+    // Lets Zigbee2MQTT offer the sensor Aqara's firmware, as Koenkk/zigbee-herdsman-converters#13385 does.
+    ota: true,
     description: 'Spatial multi-sensor (presence, illuminance and people count)',
     // Numeric-name copies catch reports that arrive before the custom clusters are registered.
     fromZigbee: [softwareZoneHeartbeat, {...softwareZoneHeartbeat,cluster:"64523"}, fp400RoomPresence, fp400Tracking, fp400Motion,
